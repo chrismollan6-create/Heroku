@@ -227,23 +227,31 @@ async function processBatch() {
       if (eventData) {
         const update = { Id: lead.Id };
         
+        console.log(`Processing Lead: ${lead.Email} (ID: ${lead.Id})`);
+        
         if (eventData.totalOpens > 0) {
           const currentCount = lead.Email_Open_Count__c || 0;
-          update.Email_Open_Count__c = currentCount + eventData.totalOpens;
+          const newCount = currentCount + eventData.totalOpens;
+          update.Email_Open_Count__c = newCount;
+          console.log(`  - Opens: ${currentCount} → ${newCount} (+${eventData.totalOpens})`);
           
           if (!lead.Last_Email_Opened_Date__c || 
               eventData.lastOpenDate > new Date(lead.Last_Email_Opened_Date__c)) {
             update.Last_Email_Opened_Date__c = eventData.lastOpenDate.toISOString();
+            console.log(`  - Last Opened: ${eventData.lastOpenDate.toISOString()}`);
           }
         }
         
         if (eventData.totalClicks > 0) {
           const currentCount = lead.Email_Click_Count__c || 0;
-          update.Email_Click_Count__c = currentCount + eventData.totalClicks;
+          const newCount = currentCount + eventData.totalClicks;
+          update.Email_Click_Count__c = newCount;
+          console.log(`  - Clicks: ${currentCount} → ${newCount} (+${eventData.totalClicks})`);
           
           if (!lead.Last_Email_Clicked_Date__c || 
               eventData.lastClickDate > new Date(lead.Last_Email_Clicked_Date__c)) {
             update.Last_Email_Clicked_Date__c = eventData.lastClickDate.toISOString();
+            console.log(`  - Last Clicked: ${eventData.lastClickDate.toISOString()}`);
           }
         }
         
@@ -254,13 +262,16 @@ async function processBatch() {
     // Update Salesforce records
     if (leadUpdates.length > 0) {
       await conn.sobject('Lead').update(leadUpdates);
-      console.log(`Updated ${leadUpdates.length} Leads`);
+      console.log(`✅ Successfully updated ${leadUpdates.length} Leads`);
+    } else {
+      console.log('ℹ️  No Leads found to update (emails may not match any Lead records)');
     }
 
     console.log('Batch processing complete');
+    console.log('---');
 
   } catch (error) {
-    console.error('Batch processing error:', error);
+    console.error('❌ Batch processing error:', error);
     console.error('Error details:', error.message);
   }
 }
