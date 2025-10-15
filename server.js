@@ -114,10 +114,9 @@ async function processBatch() {
       if (!eventsByEmail[event.email]) {
         eventsByEmail[event.email] = {
           email: event.email,
-          totalOpens: 0,
           totalClicks: 0,
-          lastOpenDate: null,
           lastClickDate: null,
+          lastClickUrl: null,
           lastBounceDate: null,
           bounceReason: null
         };
@@ -126,15 +125,11 @@ async function processBatch() {
       const emailData = eventsByEmail[event.email];
       const eventDate = new Date(event.timestamp * 1000);
 
-      if (event.eventType === 'open') {
-        emailData.totalOpens++;
-        if (!emailData.lastOpenDate || eventDate > emailData.lastOpenDate) {
-          emailData.lastOpenDate = eventDate;
-        }
-      } else if (event.eventType === 'click') {
+      if (event.eventType === 'click') {
         emailData.totalClicks++;
         if (!emailData.lastClickDate || eventDate > emailData.lastClickDate) {
           emailData.lastClickDate = eventDate;
+          emailData.lastClickUrl = event.url;
         }
       } else if (event.eventType === 'bounce' || event.eventType === 'dropped') {
         if (!emailData.lastBounceDate || eventDate > emailData.lastBounceDate) {
@@ -210,37 +205,78 @@ async function processBatch() {
     }
 
     // === PART 2: Update Lead aggregate metrics ===
+    // Priority: Check Account first, then Contact, then update Lead
+    // Only update Leads when email is NOT in Account or Contact
+    
     const emails = Object.keys(eventsByEmail);
     
-    // Query Leads only (not converted)
-    const leads = await conn.query(
-      `SELECT Id, Email, Email_Open_Count__c, Email_Click_Count__c,
-       Last_Email_Opened_Date__c, Last_Email_Clicked_Date__c
-       FROM Lead WHERE Email IN ('${emails.join("','")}') AND IsConverted = false`
+    // Step 1: Query Accounts to check if emails belong to known companies
+    const accounts = await conn.query(
+      `SELECT Id, Website FROM Account WHERE Website != null LIMIT 10000`
     );
+    
+    // Build domain to Account mapping
+    const accountsByDomain = {};
+    accounts.records.forEach(acc => {
+      if (acc.Website) {
+        const domain = acc.Website.toLowerCase()
+          .replace(/^https?:\/\//, '')
+          .replace(/^www\./, '')
+          .split('/')[0];
+        accountsByDomain[domain] = acc.Id;
+      }
+    });
+    
+    // Check which emails belong to Accounts (skip these)
+    const emailsInAccounts = new Set();
+    emails.forEach(email => {
+      const emailDomain = email.split('@')[1]?.toLowerCase();
+      if (emailDomain && accountsByDomain[emailDomain]) {
+        emailsInAccounts.add(email);
+        console.log(`⊘ Email ${email} belongs to Account (domain: ${emailDomain}) - skipping`);
+      }
+    });
 
+    // Step 2: Query Contacts for emails NOT in Accounts
+    const emailsForContacts = emails.filter(email => !emailsInAccounts.has(email));
+    
+    let contacts = { records: [] };
+    if (emailsForContacts.length > 0) {
+      contacts = await conn.query(
+        `SELECT Id, Email FROM Contact WHERE Email IN ('${emailsForContacts.join("','")}')`
+      );
+    }
+
+    // Check which emails belong to Contacts (skip these)
+    const emailsInContacts = new Set();
+    contacts.records.forEach(contact => {
+      emailsInContacts.add(contact.Email);
+      console.log(`⊘ Email ${contact.Email} is a Contact - skipping`);
+    });
+
+    // Step 3: Query Leads for emails NOT in Accounts or Contacts
+    const emailsForLeads = emails.filter(email => 
+      !emailsInAccounts.has(email) && !emailsInContacts.has(email)
+    );
+    
+    let leads = { records: [] };
+    if (emailsForLeads.length > 0) {
+      leads = await conn.query(
+        `SELECT Id, Email, Email_Click_Count__c, Last_Email_Clicked_Date__c, Last_URL_Clicked__c
+         FROM Lead WHERE Email IN ('${emailsForLeads.join("','")}') AND IsConverted = false`
+      );
+    }
+
+    const emailsMatchedToLeads = new Set(leads.records.map(l => l.Email));
     const leadUpdates = [];
 
-    // Process Leads
+    // Process Leads (ONLY update these)
     leads.records.forEach(lead => {
       const eventData = eventsByEmail[lead.Email];
       if (eventData) {
         const update = { Id: lead.Id };
         
-        console.log(`Processing Lead: ${lead.Email} (ID: ${lead.Id})`);
-        
-        if (eventData.totalOpens > 0) {
-          const currentCount = lead.Email_Open_Count__c || 0;
-          const newCount = currentCount + eventData.totalOpens;
-          update.Email_Open_Count__c = newCount;
-          console.log(`  - Opens: ${currentCount} → ${newCount} (+${eventData.totalOpens})`);
-          
-          if (!lead.Last_Email_Opened_Date__c || 
-              eventData.lastOpenDate > new Date(lead.Last_Email_Opened_Date__c)) {
-            update.Last_Email_Opened_Date__c = eventData.lastOpenDate.toISOString();
-            console.log(`  - Last Opened: ${eventData.lastOpenDate.toISOString()}`);
-          }
-        }
+        console.log(`✓ Found Lead: ${lead.Email} (ID: ${lead.Id})`);
         
         if (eventData.totalClicks > 0) {
           const currentCount = lead.Email_Click_Count__c || 0;
@@ -251,7 +287,9 @@ async function processBatch() {
           if (!lead.Last_Email_Clicked_Date__c || 
               eventData.lastClickDate > new Date(lead.Last_Email_Clicked_Date__c)) {
             update.Last_Email_Clicked_Date__c = eventData.lastClickDate.toISOString();
+            update.Last_URL_Clicked__c = eventData.lastClickUrl;
             console.log(`  - Last Clicked: ${eventData.lastClickDate.toISOString()}`);
+            console.log(`  - URL: ${eventData.lastClickUrl}`);
           }
         }
         
@@ -259,21 +297,27 @@ async function processBatch() {
       }
     });
 
-    // Check for emails that weren't found in Leads
-    const emailsFoundInLeads = new Set(leads.records.map(l => l.Email));
-    const emailsNotFound = emails.filter(email => !emailsFoundInLeads.has(email));
+    // Step 4: Log emails that weren't found anywhere
+    const allKnownEmails = new Set([
+      ...emailsInAccounts,
+      ...emailsInContacts,
+      ...emailsMatchedToLeads
+    ]);
+    
+    const emailsNotFound = emails.filter(email => !allKnownEmails.has(email));
     
     if (emailsNotFound.length > 0) {
-      console.log(`⚠️  ${emailsNotFound.length} email(s) not found in unconverted Leads:`);
+      console.log(`⚠️  ${emailsNotFound.length} email(s) not found in Account, Contact, or Lead:`);
       emailsNotFound.forEach(email => console.log(`  - ${email}`));
     }
 
-    // Update Leads
+    // Update Leads (ONLY object being updated)
     if (leadUpdates.length > 0) {
       await conn.sobject('Lead').update(leadUpdates);
       console.log(`✅ Successfully updated ${leadUpdates.length} Leads`);
     } else {
-      console.log('ℹ️  No unconverted Leads found to update');
+      const skippedCount = emailsInAccounts.size + emailsInContacts.size;
+      console.log(`ℹ️  No Leads updated (${skippedCount} emails belonged to Accounts or Contacts and were skipped)`);
     }
 
     console.log('Batch processing complete');
