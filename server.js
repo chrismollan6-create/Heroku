@@ -82,7 +82,6 @@ async function processBatch() {
           eventsByMessageId[event.sg_message_id] = {
             messageId: event.sg_message_id,
             email: event.email,
-            opens: [],
             clicks: [],
             bounce: null
           };
@@ -90,11 +89,7 @@ async function processBatch() {
 
         const msgData = eventsByMessageId[event.sg_message_id];
         
-        if (event.eventType === 'open') {
-          msgData.opens.push({
-            timestamp: new Date(event.timestamp * 1000)
-          });
-        } else if (event.eventType === 'click') {
+        if (event.eventType === 'click') {
           msgData.clicks.push({
             timestamp: new Date(event.timestamp * 1000),
             url: event.url
@@ -145,9 +140,8 @@ async function processBatch() {
     if (messageIds.length > 0) {
       // Query EmailMessage records by MessageIdentifier (stores SendGrid message ID)
       const emailMessages = await conn.query(
-        `SELECT Id, MessageIdentifier, Open_Count__c, Click_Count__c, 
-         First_Opened_Date__c, Last_Clicked_Date__c, Links_Clicked__c,
-         Bounce_Date__c, Bounce_Reason__c
+        `SELECT Id, MessageIdentifier, Click_Count__c, Last_Clicked_Date__c, 
+         Links_Clicked__c, Bounce_Date__c, Bounce_Reason__c
          FROM EmailMessage 
          WHERE MessageIdentifier IN ('${messageIds.join("','")}')`
       );
@@ -158,18 +152,6 @@ async function processBatch() {
         const eventData = eventsByMessageId[emailMsg.MessageIdentifier];
         if (eventData) {
           const update = { Id: emailMsg.Id };
-          
-          // Calculate open count
-          if (eventData.opens.length > 0) {
-            const currentOpenCount = emailMsg.Open_Count__c || 0;
-            update.Open_Count__c = currentOpenCount + eventData.opens.length;
-            
-            // Set first opened date if not already set
-            if (!emailMsg.First_Opened_Date__c) {
-              const firstOpen = eventData.opens.sort((a, b) => a.timestamp - b.timestamp)[0];
-              update.First_Opened_Date__c = firstOpen.timestamp.toISOString();
-            }
-          }
           
           // Calculate click count
           if (eventData.clicks.length > 0) {
