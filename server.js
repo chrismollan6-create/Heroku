@@ -84,7 +84,7 @@ async function processBatch() {
             email: event.email,
             opens: [],
             clicks: [],
-            bounces: []
+            bounce: null
           };
         }
 
@@ -100,10 +100,13 @@ async function processBatch() {
             url: event.url
           });
         } else if (event.eventType === 'bounce' || event.eventType === 'dropped') {
-          msgData.bounces.push({
-            timestamp: new Date(event.timestamp * 1000),
-            reason: event.reason
-          });
+          const bounceDate = new Date(event.timestamp * 1000);
+          if (!msgData.bounce || bounceDate > msgData.bounce.timestamp) {
+            msgData.bounce = {
+              timestamp: bounceDate,
+              reason: event.reason
+            };
+          }
         }
       }
 
@@ -148,7 +151,8 @@ async function processBatch() {
       // Query EmailMessage records by MessageIdentifier (stores SendGrid message ID)
       const emailMessages = await conn.query(
         `SELECT Id, MessageIdentifier, Open_Count__c, Click_Count__c, 
-         First_Opened_Date__c, Last_Clicked_Date__c, Links_Clicked__c 
+         First_Opened_Date__c, Last_Clicked_Date__c, Links_Clicked__c,
+         Bounce_Date__c, Bounce_Reason__c
          FROM EmailMessage 
          WHERE MessageIdentifier IN ('${messageIds.join("','")}')`
       );
@@ -189,6 +193,12 @@ async function processBatch() {
             update.Links_Clicked__c = allUrls.join('; ').substring(0, 255); // Limit to field length
           }
           
+          // Track bounces on EmailMessage
+          if (eventData.bounce) {
+            update.Bounce_Date__c = eventData.bounce.timestamp.toISOString();
+            update.Bounce_Reason__c = eventData.bounce.reason;
+          }
+          
           emailMessageUpdates.push(update);
         }
       });
@@ -199,24 +209,17 @@ async function processBatch() {
       }
     }
 
-    // === PART 2: Update Lead/Account aggregate metrics ===
+    // === PART 2: Update Lead aggregate metrics ===
     const emails = Object.keys(eventsByEmail);
     
-    // Query Contacts to get their Account IDs
-    const contacts = await conn.query(
-      `SELECT Id, Email, AccountId FROM Contact WHERE Email IN ('${emails.join("','")}')`
-    );
-
-    // Query Leads
+    // Query Leads only
     const leads = await conn.query(
       `SELECT Id, Email, Email_Open_Count__c, Email_Click_Count__c,
-       Last_Email_Opened_Date__c, Last_Email_Clicked_Date__c,
-       Last_Email_Bounce__c, Email_Bounce_Reason__c
+       Last_Email_Opened_Date__c, Last_Email_Clicked_Date__c
        FROM Lead WHERE Email IN ('${emails.join("','")}') AND IsConverted = false`
     );
 
     const leadUpdates = [];
-    const accountUpdates = {};
 
     // Prepare Lead updates with counters
     leads.records.forEach(lead => {
@@ -244,106 +247,9 @@ async function processBatch() {
           }
         }
         
-        if (eventData.lastBounceDate) {
-          update.Last_Email_Bounce__c = eventData.lastBounceDate.toISOString();
-          update.Email_Bounce_Reason__c = eventData.bounceReason;
-        }
-        
         leadUpdates.push(update);
       }
     });
-
-    // Prepare Account updates by rolling up Contact engagement
-    contacts.records.forEach(contact => {
-      if (contact.AccountId) {
-        const eventData = eventsByEmail[contact.Email];
-        if (eventData) {
-          if (!accountUpdates[contact.AccountId]) {
-            accountUpdates[contact.AccountId] = {
-              Id: contact.AccountId,
-              totalOpens: 0,
-              totalClicks: 0,
-              lastOpenDate: null,
-              lastClickDate: null,
-              lastBounceDate: null,
-              bounceReason: null
-            };
-          }
-
-          const accUpdate = accountUpdates[contact.AccountId];
-          
-          if (eventData.totalOpens > 0) {
-            accUpdate.totalOpens += eventData.totalOpens;
-            if (!accUpdate.lastOpenDate || eventData.lastOpenDate > accUpdate.lastOpenDate) {
-              accUpdate.lastOpenDate = eventData.lastOpenDate;
-            }
-          }
-          
-          if (eventData.totalClicks > 0) {
-            accUpdate.totalClicks += eventData.totalClicks;
-            if (!accUpdate.lastClickDate || eventData.lastClickDate > accUpdate.lastClickDate) {
-              accUpdate.lastClickDate = eventData.lastClickDate;
-            }
-          }
-          
-          if (eventData.lastBounceDate) {
-            if (!accUpdate.lastBounceDate || eventData.lastBounceDate > accUpdate.lastBounceDate) {
-              accUpdate.lastBounceDate = eventData.lastBounceDate;
-              accUpdate.bounceReason = eventData.bounceReason;
-            }
-          }
-        }
-      }
-    });
-
-    // Query existing Account data to get current counts
-    const accountIds = Object.keys(accountUpdates);
-    if (accountIds.length > 0) {
-      const accounts = await conn.query(
-        `SELECT Id, Email_Open_Count__c, Email_Click_Count__c,
-         Last_Email_Opened_Date__c, Last_Email_Clicked_Date__c,
-         Last_Email_Bounce__c, Email_Bounce_Reason__c
-         FROM Account WHERE Id IN ('${accountIds.join("','")}')`
-      );
-
-      const accountUpdateRecords = [];
-      accounts.records.forEach(account => {
-        const updateData = accountUpdates[account.Id];
-        const update = { Id: account.Id };
-        
-        if (updateData.totalOpens > 0) {
-          const currentCount = account.Email_Open_Count__c || 0;
-          update.Email_Open_Count__c = currentCount + updateData.totalOpens;
-          
-          if (!account.Last_Email_Opened_Date__c || 
-              updateData.lastOpenDate > new Date(account.Last_Email_Opened_Date__c)) {
-            update.Last_Email_Opened_Date__c = updateData.lastOpenDate.toISOString();
-          }
-        }
-        
-        if (updateData.totalClicks > 0) {
-          const currentCount = account.Email_Click_Count__c || 0;
-          update.Email_Click_Count__c = currentCount + updateData.totalClicks;
-          
-          if (!account.Last_Email_Clicked_Date__c || 
-              updateData.lastClickDate > new Date(account.Last_Email_Clicked_Date__c)) {
-            update.Last_Email_Clicked_Date__c = updateData.lastClickDate.toISOString();
-          }
-        }
-        
-        if (updateData.lastBounceDate) {
-          update.Last_Email_Bounce__c = updateData.lastBounceDate.toISOString();
-          update.Email_Bounce_Reason__c = updateData.bounceReason;
-        }
-        
-        accountUpdateRecords.push(update);
-      });
-
-      if (accountUpdateRecords.length > 0) {
-        await conn.sobject('Account').update(accountUpdateRecords);
-        console.log(`Updated ${accountUpdateRecords.length} Accounts`);
-      }
-    }
 
     // Update Salesforce records
     if (leadUpdates.length > 0) {
