@@ -212,7 +212,7 @@ async function processBatch() {
     // === PART 2: Update Lead aggregate metrics ===
     const emails = Object.keys(eventsByEmail);
     
-    // Query Leads only
+    // Query Leads only (not converted)
     const leads = await conn.query(
       `SELECT Id, Email, Email_Open_Count__c, Email_Click_Count__c,
        Last_Email_Opened_Date__c, Last_Email_Clicked_Date__c
@@ -221,7 +221,7 @@ async function processBatch() {
 
     const leadUpdates = [];
 
-    // Prepare Lead updates with counters
+    // Process Leads
     leads.records.forEach(lead => {
       const eventData = eventsByEmail[lead.Email];
       if (eventData) {
@@ -259,12 +259,21 @@ async function processBatch() {
       }
     });
 
-    // Update Salesforce records
+    // Check for emails that weren't found in Leads
+    const emailsFoundInLeads = new Set(leads.records.map(l => l.Email));
+    const emailsNotFound = emails.filter(email => !emailsFoundInLeads.has(email));
+    
+    if (emailsNotFound.length > 0) {
+      console.log(`⚠️  ${emailsNotFound.length} email(s) not found in unconverted Leads:`);
+      emailsNotFound.forEach(email => console.log(`  - ${email}`));
+    }
+
+    // Update Leads
     if (leadUpdates.length > 0) {
       await conn.sobject('Lead').update(leadUpdates);
       console.log(`✅ Successfully updated ${leadUpdates.length} Leads`);
     } else {
-      console.log('ℹ️  No Leads found to update (emails may not match any Lead records)');
+      console.log('ℹ️  No unconverted Leads found to update');
     }
 
     console.log('Batch processing complete');
