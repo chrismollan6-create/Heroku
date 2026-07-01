@@ -16,6 +16,34 @@ const BATCH_SIZE = 100;
 const BATCH_TIMEOUT = 60000; // 1 minute
 let batchTimer = null;
 
+// --- SOQL injection guards -------------------------------------------------
+// Values in these webhook events (emails, SendGrid message IDs) originate from
+// an unauthenticated public request body, so they must never be concatenated
+// into SOQL unescaped. Escape per SOQL string-literal rules and build IN lists
+// through this helper only.
+function soqlEscape(value) {
+  return String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'")
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r');
+}
+
+// Build a quoted, comma-separated IN(...) list from raw values.
+// Drops null/blank entries; returns null if nothing valid remains.
+function soqlInList(values) {
+  const cleaned = (values || [])
+    .filter(v => v !== null && v !== undefined && String(v).trim() !== '');
+  if (cleaned.length === 0) return null;
+  return cleaned.map(v => `'${soqlEscape(v)}'`).join(',');
+}
+
+// Basic email shape check — defence-in-depth so malformed/injection-y values
+// never even reach the query (they could never match a real record anyway).
+function isValidEmail(email) {
+  return typeof email === 'string' && /^[^\s'"@]+@[^\s'"@]+\.[^\s'"@]+$/.test(email);
+}
+
 // SendGrid webhook endpoint
 app.post('/webhook/sendgrid', async (req, res) => {
   try {
@@ -137,13 +165,14 @@ async function processBatch() {
     // === PART 1: Update EmailMessage records ===
     const messageIds = Object.keys(eventsByMessageId);
     
-    if (messageIds.length > 0) {
+    const messageIdInList = soqlInList(messageIds);
+    if (messageIdInList) {
       // Query EmailMessage records by MessageIdentifier (stores SendGrid message ID)
       const emailMessages = await conn.query(
-        `SELECT Id, MessageIdentifier, Click_Count__c, Last_Clicked_Date__c, 
+        `SELECT Id, MessageIdentifier, Click_Count__c, Last_Clicked_Date__c,
          Links_Clicked__c, Bounce_Date__c, Bounce_Reason__c
-         FROM EmailMessage 
-         WHERE MessageIdentifier IN ('${messageIds.join("','")}')`
+         FROM EmailMessage
+         WHERE MessageIdentifier IN (${messageIdInList})`
       );
 
       const emailMessageUpdates = [];
@@ -220,12 +249,13 @@ async function processBatch() {
     });
 
     // Step 2: Query Contacts for emails NOT in Accounts
-    const emailsForContacts = emails.filter(email => !emailsInAccounts.has(email));
-    
+    const emailsForContacts = emails.filter(email => !emailsInAccounts.has(email) && isValidEmail(email));
+
     let contacts = { records: [] };
-    if (emailsForContacts.length > 0) {
+    const contactInList = soqlInList(emailsForContacts);
+    if (contactInList) {
       contacts = await conn.query(
-        `SELECT Id, Email FROM Contact WHERE Email IN ('${emailsForContacts.join("','")}')`
+        `SELECT Id, Email FROM Contact WHERE Email IN (${contactInList})`
       );
     }
 
@@ -237,15 +267,16 @@ async function processBatch() {
     });
 
     // Step 3: Query Leads for emails NOT in Accounts or Contacts
-    const emailsForLeads = emails.filter(email => 
-      !emailsInAccounts.has(email) && !emailsInContacts.has(email)
+    const emailsForLeads = emails.filter(email =>
+      !emailsInAccounts.has(email) && !emailsInContacts.has(email) && isValidEmail(email)
     );
-    
+
     let leads = { records: [] };
-    if (emailsForLeads.length > 0) {
+    const leadInList = soqlInList(emailsForLeads);
+    if (leadInList) {
       leads = await conn.query(
         `SELECT Id, Email, Email_Click_Count__c, Last_Email_Clicked_Date__c, Last_URL_Clicked__c
-         FROM Lead WHERE Email IN ('${emailsForLeads.join("','")}') AND IsConverted = false`
+         FROM Lead WHERE Email IN (${leadInList}) AND IsConverted = false`
       );
     }
 
