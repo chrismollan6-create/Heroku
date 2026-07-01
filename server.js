@@ -1,7 +1,10 @@
 const express = require('express');
+const helmet = require('helmet');
 const jsforce = require('jsforce');
 const app = express();
 
+// Emit standard security headers (HSTS, X-Frame-Options, no-sniff, etc.)
+app.use(helmet());
 app.use(express.json());
 
 // Environment variables (set in Heroku)
